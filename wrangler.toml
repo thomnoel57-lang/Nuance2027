@@ -1,0 +1,42 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "nuance"
+main = "worker/worker.js"
+compatibility_date = "2026-11-01"
+
+# ---------------------------------------------------------------------
+# Hébergement statique et API sur le MÊME domaine.
+# Conséquence : aucune configuration CORS, et le cookie de session
+# peut rester en SameSite=Lax (cookies cross-site sont bloqués par les
+# navigateurs, et SameSite=None exigerait des contraintes supplémentaires).
+# ---------------------------------------------------------------------
+[assets]
+directory = "./public"
+binding = "ASSETS"
+# Le Worker s'exécute avant les assets pour TOUTES les requêtes, puis délègue
+# le non-API à env.ASSETS (voir worker/worker.js). Forme booléenne retenue car
+# elle est acceptée aussi bien par Wrangler v3 que v4 (le tableau de motifs
+# n'existe qu'à partir de v4).
+run_worker_first = true
+not_found_handling = "single-page-application"
+
+# ---------------------------------------------------------------------
+# Base de données
+# ---------------------------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+database_name = "nuance-db"
+# Remplacer par l'identifiant renvoyé par : npx wrangler d1 create nuance-db
+database_id = "REMPLACER-PAR-VOTRE-DATABASE-ID"
+
+# ---------------------------------------------------------------------
+# Journalisation (utile pour diagnostiquer les 500)
+# ---------------------------------------------------------------------
+[observability]
+enabled = true
+
+# ---------------------------------------------------------------------
+# Domaine personnalisé (facultatif — décommenter après avoir ajouté la zone)
+# ---------------------------------------------------------------------
+# [[routes]]
+# pattern = "çavote.fr"
+# custom_domain = true

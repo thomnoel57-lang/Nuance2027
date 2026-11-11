@@ -1,0 +1,27 @@
+{
+  "name": "nuance-cloudflare",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Nuance — hébergement Cloudflare Workers + D1 avec comptes utilisateurs",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create nuance-db",
+    "db:init": "wrangler d1 execute nuance-db --remote --file=./worker/schema.sql",
+    "db:init:local": "wrangler d1 execute nuance-db --local --file=./worker/schema.sql",
+    "db:console": "wrangler d1 execute nuance-db --remote --command=\"SELECT id, email, created_at FROM users\"",
+    "test": "node worker/test-local.mjs",
+    "tail": "wrangler tail",
+    "preview": "wrangler dev",
+    "smoke": "bash scripts/smoke-test.sh",
+    "dev:local": "node dev-server.mjs"
+  },
+  "devDependencies": {
+    "better-sqlite3": "^12.0.0",
+    "wrangler": "^4.160.1"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
