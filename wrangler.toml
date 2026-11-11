@@ -26,7 +26,7 @@ not_found_handling = "single-page-application"
 binding = "DB"
 database_name = "nuance-db"
 # Remplacer par l'identifiant renvoyé par : npx wrangler d1 create nuance-db
-database_id = "REMPLACER-PAR-VOTRE-DATABASE-ID"
+database_id = "252de94b-665e-41da-bf08-237b887b6b78"
 
 # ---------------------------------------------------------------------
 # Journalisation (utile pour diagnostiquer les 500)
