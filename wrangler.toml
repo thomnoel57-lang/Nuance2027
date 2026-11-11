@@ -1,5 +1,5 @@
 #:schema node_modules/wrangler/config-schema.json
-name = "nuance"
+name = "nuance2027"
 main = "worker/worker.js"
 compatibility_date = "2026-11-01"
 
