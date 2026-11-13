@@ -31,7 +31,11 @@ database_id = "252de94b-665e-41da-bf08-237b887b6b78"
 # ---------------------------------------------------------------------
 # Journalisation (utile pour diagnostiquer les 500)
 # ---------------------------------------------------------------------
-[observability]
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[observability.traces]
 enabled = true
 
 # ---------------------------------------------------------------------
