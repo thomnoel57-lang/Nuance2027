@@ -1,0 +1,5 @@
+# Dépendances et données de développement locales (peuvent contenir des réponses privées).
+node_modules/
+.wrangler/
+dev.sqlite
+dev.sqlite-*
