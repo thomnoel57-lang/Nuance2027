@@ -3046,7 +3046,7 @@ body.quiz-screen{height:100vh;height:100dvh;overflow:hidden;overscroll-behavior:
 
       <div class="panel" style="margin-top:1.2rem">
         <h3>10. Données personnelles &amp; rétrocompatibilité technique</h3>
-        <p>Tes réponses restent dans ce navigateur (<code>localStorage['nuance-v11']</code>, non chiffré). Aucun serveur, aucun compte ni traceur n’est utilisé : tout fonctionne hors ligne. Le nom de clé <code>nuance-v11</code> et le format de lien partagé <code>#p=…</code> (champ technique <code>v: 11</code>) sont volontairement conservés depuis la version V11 afin de ne jamais effacer tes réponses ou casser tes anciens liens de partage lors des mises à jour vers Nuance V16 (migrations automatiques depuis v8/v9/v10 incluses).</p>
+        <p>Tes réponses restent dans ce navigateur (<code>localStorage['nuance-v11']</code>, non chiffré). Sans compte, tes réponses restent locales. Si tu actives un compte, elles sont aussi envoyées et stockées sur Cloudflare D1 pour la synchronisation. Elles peuvent révéler des opinions politiques : utilise cette option uniquement si tu acceptes ce stockage. Le navigateur conserve les données locales après déconnexion ; efface-les depuis le profil si nécessaire. Un lien de partage contient les réponses partagées et peut être lu par toute personne qui le possède. Le nom de clé <code>nuance-v11</code> et le format de lien partagé <code>#p=…</code> (champ technique <code>v: 11</code>) sont volontairement conservés depuis la version V11 afin de ne jamais effacer tes réponses ou casser tes anciens liens de partage lors des mises à jour vers Nuance V16 (migrations automatiques depuis v8/v9/v10 incluses).</p>
         <div class="btn-row" style="margin-top:.8rem">
           <button class="btn sm" type="button" id="print-results">Imprimer / PDF</button>
           <button class="btn sm" type="button" data-nav="profile">Gérer mes réponses</button>
@@ -31704,6 +31704,10 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
   var syncTimer = null;
   var syncInFlight = false;
   var pendingSyncAfterFlight = false;
+  var currentSyncPromise = null;
+  var syncRetryDelay = 5000;
+  var syncFailureWarned = false;
+  var syncNeedsBackup = false;
   var activeConflict = null;
   var conflictLastFocus = null;
 
@@ -35992,13 +35996,33 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
     }
   }
 
+  function canonicalSub(sub) {
+    if (!sub || typeof sub !== 'object') return null;
+    var sorted = {};
+    Object.keys(sub).sort().forEach(function (key) { sorted[key] = sub[key]; });
+    return Object.keys(sorted).length ? sorted : null;
+  }
+
+  function canonicalValue(value) {
+    if (Array.isArray(value)) return value.map(canonicalValue);
+    if (!value || typeof value !== 'object') return value;
+    var out = {};
+    Object.keys(value).sort().forEach(function (key) { out[key] = canonicalValue(value[key]); });
+    return out;
+  }
+
+  function snapshotsMatch(a, b) {
+    return JSON.stringify(canonicalValue((a && a.stageSnapshots) || {})) ===
+      JSON.stringify(canonicalValue((b && b.stageSnapshots) || {}));
+  }
+
   function meaningfulSignature(stObj) {
     var s = normalizeStateObject(stObj);
     var keys = Object.keys(s.answers).sort();
     var normAns = {};
     keys.forEach(function (k) {
       var a = s.answers[k];
-      normAns[k] = { st: a.st, imp: a.imp || 2, lv: a.lv || null, sub: a.sub || null };
+      normAns[k] = { st: a.st, imp: a.imp || 2, lv: a.lv || null, sub: canonicalSub(a.sub) };
     });
     return JSON.stringify({
       answers: normAns,
@@ -36018,8 +36042,8 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
       var l = lAns[id], r = rAns[id];
       if (l && l.st && !(r && r.st)) { onlyLocal++; return; }
       if (r && r.st && !(l && l.st)) { onlyRemote++; return; }
-      var lSig = JSON.stringify({ st: l.st, imp: l.imp || 2, lv: l.lv || null, sub: l.sub || null });
-      var rSig = JSON.stringify({ st: r.st, imp: r.imp || 2, lv: r.lv || null, sub: r.sub || null });
+      var lSig = JSON.stringify({ st: l.st, imp: l.imp || 2, lv: l.lv || null, sub: canonicalSub(l.sub) });
+      var rSig = JSON.stringify({ st: r.st, imp: r.imp || 2, lv: r.lv || null, sub: canonicalSub(r.sub) });
       if (lSig === rSig) identical++;
       else divergent.push({ id: id, item: ITEM_BY_ID[id], local: l, remote: r });
     });
@@ -36109,6 +36133,8 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
   }
 
   function openConflictModal(localSt, remoteSt, remoteRev, remoteUpdatedAt, contextType) {
+    authState.syncPausedForConflict = true;
+    clearTimeout(syncTimer); syncTimer = null;
     activeConflict = {
       local: normalizeStateObject(localSt),
       remote: remoteSt ? normalizeStateObject(remoteSt) : null,
@@ -36122,7 +36148,7 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
 
     if ($('conflict-desc')) {
       $('conflict-desc').textContent = contextType === 'new_account_with_local'
-        ? 'Ton nouveau compte est prêt, et des réponses locales existent déjà dans ce navigateur. Tes données locales restent intactes : choisis comment les associer.'
+        ? 'Ce compte ne contient pas encore de réponses, mais ce navigateur en contient. Choisis si tu souhaites les associer à ce compte.'
         : 'Les données de cet appareil et celles de ton compte Cloudflare D1 diffèrent. Tes données locales ne seront jamais supprimées : choisis l’option qui te convient.';
     }
     if ($('conflict-compare')) {
@@ -36150,9 +36176,16 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
         diff.divergent.slice(0, 5).forEach(function (d) {
           var lLbl = ST[d.local.st] ? ST[d.local.st].label : d.local.st;
           var rLbl = ST[d.remote.st] ? ST[d.remote.st].label : d.remote.st;
-          summaryLines.push('• <b>' + esc(shortText(d.item ? d.item.text : d.id, 64)) + '</b> : Appareil « ' + esc(lLbl) + ' » vs D1 « ' + esc(rLbl) + ' »');
+          var details = lLbl === rLbl ? ' (importance ou précisions différentes)' : '';
+          summaryLines.push('• <b>' + esc(shortText(d.item ? d.item.text : d.id, 64)) + '</b> : Appareil « ' + esc(lLbl) + ' » vs D1 « ' + esc(rLbl) + ' »' + details);
         });
         if (diff.divergent.length > 5) summaryLines.push('<span class="muted">… et ' + (diff.divergent.length - 5) + ' autre(s) écart(s).</span>');
+      }
+      if (activeConflict.remote && !snapshotsMatch(activeConflict.local, activeConflict.remote)) {
+        summaryLines.push('Les sauvegardes des étapes du parcours diffèrent également.');
+      }
+      if (activeConflict.remote && (activeConflict.local.checkpoint !== activeConflict.remote.checkpoint || activeConflict.local.finished !== activeConflict.remote.finished)) {
+        summaryLines.push('L’étape ou l’état de fin du parcours diffère également.');
       }
       diffEl.innerHTML = summaryLines.join('<br>');
       diffEl.hidden = false;
@@ -36164,7 +36197,7 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
     if (remoteBtn) {
       remoteBtn.innerHTML = activeConflict.remote
         ? '<span><b>Utiliser les données du compte (Cloudflare D1 → appareil)</b><br><span class="tiny muted">Charge ton profil distant et conserve intacte une sauvegarde locale restaurable à tout moment.</span></span>'
-        : '<span><b>Démarrer ce nouveau compte à blanc (sans effacer le localStorage)</b><br><span class="tiny muted">Archive tes réponses locales dans la sauvegarde locale restaurable et démarre un profil vierge pour ce compte.</span></span>';
+        : '<span><b>Démarrer ce compte à blanc</b><br><span class="tiny muted">Archive tes réponses locales dans la sauvegarde locale restaurable et démarre un profil vierge pour ce compte.</span></span>';
     }
 
     conflictLastFocus = document.activeElement;
@@ -36219,7 +36252,11 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
     }
 
     if (choice === 'prefer_remote') {
-      preserveLocalBackup('before_prefer_remote');
+      if (hasMeaningfulProgress(c.local) && !preserveLocalBackup('before_prefer_remote')) {
+        toast('Sauvegarde locale impossible. Exporte tes réponses avant de continuer.');
+        openConflictModal(c.local, c.remote, c.remoteRevision, c.remoteUpdatedAt, c.contextType);
+        return;
+      }
       authState.sessionLocalOnly = false;
       authState.syncPausedForConflict = false;
       if (c.remote) {
@@ -36229,7 +36266,7 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
         toast('Données du compte chargées (copie locale préservée dans les sauvegardes).');
       } else {
         applyStateInMemoryAndSaveLocal({ v: 16, answers: {} }, null);
-        authState.revision = 0;
+        authState.revision = c.remoteRevision;
         toast('Nouveau profil vierge prêt (tes données locales restent préservées en sauvegarde).');
       }
       finishAuthNavigation();
@@ -36239,7 +36276,7 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
     if (choice === 'prefer_local') {
       authState.sessionLocalOnly = false;
       authState.syncPausedForConflict = false;
-      pushStateToCloud(c.local, { force: true, backupPrevious: true, reason: 'conflict_prefer_local' }).then(function (ok) {
+      pushStateToCloud(c.local, { expectedRevision: c.remoteRevision, waitForFlight: true, backupPrevious: true, reason: 'conflict_prefer_local' }).then(function (ok) {
         if (ok) toast('Données locales envoyées sur Cloudflare D1 (ancien état serveur archivé).');
         finishAuthNavigation();
       });
@@ -36247,42 +36284,72 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
     }
 
     if (choice === 'merge_newest') {
-      preserveLocalBackup('before_merge');
+      if (hasMeaningfulProgress(c.local) && !preserveLocalBackup('before_merge')) {
+        toast('Sauvegarde locale impossible. Exporte tes réponses avant de continuer.');
+        openConflictModal(c.local, c.remote, c.remoteRevision, c.remoteUpdatedAt, c.contextType);
+        return;
+      }
       var merged = mergeStatesIntelligently(c.local, c.remote, 'newest');
       authState.sessionLocalOnly = false;
       authState.syncPausedForConflict = false;
       applyStateInMemoryAndSaveLocal(merged, null);
-      pushStateToCloud(merged, { force: true, backupPrevious: true, reason: 'conflict_merge_newest' }).then(function (ok) {
+      pushStateToCloud(merged, { expectedRevision: c.remoteRevision, waitForFlight: true, backupPrevious: true, reason: 'conflict_merge_newest' }).then(function (ok) {
         if (ok) toast('Données fusionnées et synchronisées (' + countAnyAnswered(merged.answers) + ' réponses).');
         finishAuthNavigation();
       });
     }
   }
 
+  function warnAndRetrySync() {
+    if (!syncFailureWarned) {
+      syncFailureWarned = true;
+      toast('Synchronisation impossible : réponses conservées sur cet appareil. Nouvelle tentative automatique.');
+    }
+    if (!authState.authenticated || authState.sessionLocalOnly || authState.syncPausedForConflict) return;
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(function () {
+      syncTimer = null;
+      pushStateToCloud(captureStateSnapshot(), { backupPrevious: syncNeedsBackup, reason: 'retry_sync' });
+    }, syncRetryDelay);
+    syncRetryDelay = Math.min(syncRetryDelay * 2, 60000);
+  }
+
   function pushStateToCloud(payloadState, opts) {
     opts = opts || {};
     if (!authState.authenticated || !authState.apiAvailable) return Promise.resolve(false);
     if (authState.sessionLocalOnly && !opts.force) return Promise.resolve(false);
-    if (syncInFlight && !opts.force) {
+    if (syncInFlight) {
+      if (opts.waitForFlight && currentSyncPromise) {
+        return currentSyncPromise.then(function () { return pushStateToCloud(payloadState, opts); });
+      }
       pendingSyncAfterFlight = true;
+      if (opts.backupPrevious) syncNeedsBackup = true;
       return Promise.resolve(false);
     }
     syncInFlight = true;
-    return apiFetch('/api/state', {
+    if (opts.backupPrevious) syncNeedsBackup = true;
+    var sentBackup = syncNeedsBackup;
+    currentSyncPromise = apiFetch('/api/state', {
       method: 'PUT',
       keepalive: !!opts.keepalive,
       body: {
         state: payloadState || captureStateSnapshot(),
-        expectedRevision: opts.force ? null : authState.revision,
+        expectedRevision: opts.force ? null : (opts.expectedRevision !== undefined ? opts.expectedRevision : authState.revision),
         force: !!opts.force,
-        backupPrevious: !!opts.backupPrevious,
+        backupPrevious: sentBackup,
         migratedFromLocal: !!opts.migratedFromLocal,
         reason: opts.reason || 'auto_sync'
       }
     }).then(function (res) {
       syncInFlight = false;
-      if (res.networkError) return false;
       if (res.status === 409 && res.data && res.data.conflict) {
+        if (res.data.serverState && meaningfulSignature(captureStateSnapshot()) === meaningfulSignature(res.data.serverState) && snapshotsMatch(captureStateSnapshot(), res.data.serverState)) {
+          authState.revision = res.data.serverRevision;
+          authState.lastSyncedAt = res.data.serverUpdatedAt || null;
+          pendingSyncAfterFlight = false;
+          scheduleCloudSync();
+          return false;
+        }
         authState.syncPausedForConflict = true;
         openConflictModal(captureStateSnapshot(), res.data.serverState, res.data.serverRevision, res.data.serverUpdatedAt, 'server_409');
         return false;
@@ -36290,11 +36357,15 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
       if (res.status === 401) {
         authState.authenticated = false;
         updateNavAuthLabel();
+        toast('Session expirée : réponses conservées sur cet appareil. Reconnecte-toi pour synchroniser.');
         return false;
       }
       if (res.ok && res.data && res.data.ok) {
-        authState.revision = res.data.revision || authState.revision;
+        authState.revision = res.data.revision;
         authState.lastSyncedAt = res.data.updatedAt || new Date().toISOString();
+        if (sentBackup) syncNeedsBackup = false;
+        syncRetryDelay = 5000;
+        if (syncFailureWarned) { syncFailureWarned = false; toast('Synchronisation rétablie.'); }
         if (currentView === 'profile') renderProfileCloud();
         if (pendingSyncAfterFlight) {
           pendingSyncAfterFlight = false;
@@ -36302,14 +36373,21 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
         }
         return true;
       }
+      if (res.status === 400 || res.status === 413) {
+        toast('Synchronisation refusée : ' + ((res.data && res.data.error) || 'données invalides') + ' Tes réponses restent sur cet appareil ; exporte-les.');
+        return false;
+      }
+      warnAndRetrySync();
       return false;
     });
+    return currentSyncPromise;
   }
 
   function scheduleCloudSync() {
     if (!authState.authenticated || !authState.apiAvailable || authState.sessionLocalOnly || authState.syncPausedForConflict) return;
     clearTimeout(syncTimer);
     syncTimer = setTimeout(function () {
+      syncTimer = null;
       pushStateToCloud(captureStateSnapshot(), { reason: 'auto_sync' });
     }, 750);
   }
@@ -36336,19 +36414,15 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
     }
 
     if (!hasRemote && hasLocal) {
-      if (context === 'new_account_non_first') {
-        openConflictModal(localSnap, null, 0, null, 'new_account_with_local');
-        return;
-      }
-      pushStateToCloud(localSnap, { force: true, migratedFromLocal: true, reason: 'initial_local_upload' }).then(function (ok) {
-        if (ok) toast('Données locales synchronisées vers votre compte Cloudflare D1.');
-        finishAuthNavigation();
-      });
+      // Ne jamais associer automatiquement des réponses locales à un compte
+      // vide : elles peuvent appartenir à un autre utilisateur de l'appareil.
+      authState.syncPausedForConflict = true;
+      openConflictModal(localSnap, null, remoteRev || 0, remoteUpdatedAt, 'new_account_with_local');
       return;
     }
 
     // Les deux côtés ont des données : comparaison déterministe
-    if (meaningfulSignature(localSnap) === meaningfulSignature(remoteState)) {
+    if (meaningfulSignature(localSnap) === meaningfulSignature(remoteState) && snapshotsMatch(localSnap, remoteState)) {
       authState.revision = remoteRev || 1;
       authState.lastSyncedAt = remoteUpdatedAt || null;
       finishAuthNavigation();
@@ -36498,6 +36572,9 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
       authState.sessionLocalOnly = false;
       authState.syncPausedForConflict = false;
       authState.localModeChosen = false;
+      clearTimeout(syncTimer); syncTimer = null;
+      syncNeedsBackup = false; pendingSyncAfterFlight = false;
+      syncFailureWarned = false; syncRetryDelay = 5000;
       updateNavAuthLabel();
       toast('Déconnecté — tes réponses locales dans ce navigateur sont intactes.');
       go('auth');
@@ -36556,8 +36633,15 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
               if (!r.ok || !r.data || !r.data.backup || !r.data.backup.state) {
                 toast('Impossible de récupérer cette archive.'); return;
               }
-              applyStateInMemoryAndSaveLocal(r.data.backup.state, 'before_server_backup_restore');
-              toast('Archive serveur restaurée (' + countAnyAnswered(r.data.backup.state.answers) + ' réponses).');
+              if (!confirm('Restaurer cette archive ? Le profil actuel sera sauvegardé avant remplacement.')) return;
+              if (hasMeaningfulProgress(captureStateSnapshot()) && !preserveLocalBackup('before_server_backup_restore')) {
+                toast('Sauvegarde locale impossible. Exporte tes réponses avant de restaurer.'); return;
+              }
+              applyStateInMemoryAndSaveLocal(r.data.backup.state, null);
+              pushStateToCloud(captureStateSnapshot(), { waitForFlight: true, backupPrevious: true, reason: 'server_backup_restore' }).then(function (ok) {
+                if (ok) toast('Archive restaurée et synchronisée.');
+                else if (authState.sessionLocalOnly) toast('Archive restaurée sur cet appareil ; synchronisation suspendue en mode local.');
+              });
               renderProfile();
               renderProfileCloud();
             });
@@ -37160,10 +37244,12 @@ window.SUB_OBJECTIONS = SUB_OBJECTIONS;
       });
     }
     var searchInput = $('cand-answers-search');
+    var searchTimer = null;
     if (searchInput) {
       searchInput.addEventListener('input', function () {
         modalSearchQuery = this.value;
-        renderCandidateAnswersList();
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(renderCandidateAnswersList, 150);
       });
     }
     document.addEventListener('change', function (ev) {

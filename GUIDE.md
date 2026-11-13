@@ -97,7 +97,7 @@ cloudflare-guide/
 │   ├── api.js                  ← simple ré-export
 │   ├── worker.js               ← point d'entrée : routage /api/*, statique, en-têtes de sécurité
 │   ├── schema.sql              ← structure de la base D1
-│   └── test-local.mjs          ← 48 tests de l'API (sans Cloudflare)
+│   └── test-local.mjs          ← tests de l'API (sans Cloudflare)
 ├── scripts/
 │   └── smoke-test.sh           ← vérifie le site déployé (18 contrôles)
 ├── wrangler.toml               ← configuration du déploiement
@@ -228,7 +228,7 @@ puis `npx wrangler deploy`. Cloudflare crée le certificat TLS automatiquement.
 | **Sessions** | Jeton aléatoire de 32 octets. La base ne stocke que son **SHA-256** : une fuite de la base ne permet pas de rejouer une session. |
 | **Cookie** | `HttpOnly` (inaccessible au JavaScript, donc au XSS), `Secure`, `SameSite=Lax`, 30 jours. |
 | **Comparaison** | À temps constant, pour ne pas fuiter d'information par le temps de réponse. |
-| **Anti-force brute** | 5 échecs en 15 minutes sur un couple e-mail+IP → blocage temporaire (HTTP 429). |
+| **Anti-force brute** | Sur 15 minutes : 5 échecs par couple e-mail+IP, 50 par IP ou 20 par e-mail → blocage temporaire (HTTP 429). Les réseaux partagés peuvent être affectés. |
 | **Énumération de comptes** | Le message d'erreur est identique que l'e-mail existe ou non. |
 | **Concurrence** | `expectedRevision` : si un autre appareil a écrit entre-temps, l'API répond **409** avec l'état serveur — votre client ouvre alors sa fenêtre de conflit. |
 | **Entrées** | Chaque état est **normalisé et borné** côté serveur (`sanitizeState`) : pas de pollution de prototype, `imp` ramené à {1,2,3}, tailles plafonnées. |
@@ -239,7 +239,7 @@ puis `npx wrangler deploy`. Cloudflare crée le certificat TLS automatiquement.
 
 Le plan **Workers Free** limite à **10 ms de CPU par requête**. PBKDF2 à 600 000 itérations (la recommandation OWASP) dépasse ce budget.
 
-Le code utilise donc **100 000 itérations par défaut**, stockées **par compte** dans la colonne `iterations`. Conséquences :
+Le code utilise donc **100 000 itérations par défaut**, stockées **par compte** dans la colonne `iterations`. Conséquences : Après une augmentation de `PBKDF2_ITERATIONS`, les comptes existants sont progressivement ré-hachés lors de leur prochaine connexion réussie. Vérifiez le budget CPU et testez avant déploiement.
 
 - cela tient sur le plan gratuit ;
 - **augmenter la valeur ne casse aucun compte existant** : chacun reste vérifiable avec son propre coût.
@@ -424,3 +424,12 @@ if (path === '/api/mon-endpoint' && method === 'GET') {
 ```
 
 Puis `npm run test` et `npx wrangler deploy`. Pas de redémarrage, pas de conteneur, pas de certificat à gérer.
+
+
+## Synchronisation : vérifications et précautions
+
+- Les réponses détaillées (`sub`) sont conservées par l'API. Les précisions supprimées par une ancienne version ne peuvent pas être recréées automatiquement : avant toute résolution de conflit, exporter les réponses depuis l'appareil qui les possède encore. Les sauvegardes locales et archives serveur peuvent aussi aider.
+- Les écritures utilisent un contrôle de révision atomique D1 ; lors d'un vrai conflit, une sélection explicite est demandée. Un compte vide demande confirmation avant d'associer les réponses de l'appareil.
+- Une interruption réseau déclenche un avertissement et des tentatives espacées tant que la page est ouverte. Les réponses restent en local ; la synchronisation n'est pas garantie après fermeture du navigateur.
+- `npm test` exécute les tests API et des scénarios client dans jsdom. Ils ne remplacent pas les essais sur de vrais navigateurs ni sur plusieurs appareils. Pour tester le Worker avec une base D1 locale isolée, initialiser le schéma puis lancer `wrangler dev --local` avec le même répertoire `--persist-to`.
+- L'API limite le corps JSON à 2 Mio. Sauvegarder régulièrement les réponses par export JSON et protéger ces fichiers, qui peuvent révéler des opinions politiques.

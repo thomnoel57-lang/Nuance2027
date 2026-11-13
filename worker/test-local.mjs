@@ -16,21 +16,22 @@ const stmt = (sql, params = []) => {
   const norm = params.map((p) => (p === undefined ? null : p));
   return {
     bind: (...more) => stmt(sql, [...norm, ...more]),
+    _runSync: () => /^\s*SELECT\b/i.test(sql) ? ({ success: true, results: db.prepare(sql).all(...norm), meta: {} }) : ({ success: true, meta: db.prepare(sql).run(...norm) }),
     first: async () => s.get(...norm) ?? null,
     all: async () => ({ results: s.all(...norm) }),
     run: async () => ({ success: true, meta: s.run(...norm) }),
   };
 };
-const env = { DB: { prepare: (sql) => stmt(sql) } };
+const env = { DB: { prepare: (sql) => stmt(sql), batch: async (statements) => db.transaction(() => statements.map((s) => s._runSync()))() } };
 
 // --- helpers de requête ---
 const ORIGIN = 'https://exemple.test';
 let cookie = '';
-const call = async (path, { method = 'GET', body, raw, cookies = cookie } = {}) => {
+const call = async (path, { method = 'GET', body, raw, cookies = cookie, ip = '203.0.113.7' } = {}) => {
   const headers = new Headers({ Accept: 'application/json' });
   if (body || raw !== undefined) headers.set('Content-Type', 'application/json');
   if (cookies) headers.set('Cookie', cookies);
-  headers.set('CF-Connecting-IP', '203.0.113.7');
+  headers.set('CF-Connecting-IP', ip);
   const res = await api.fetch(
     new Request(ORIGIN + path, { method, headers, body: raw !== undefined ? raw : body ? JSON.stringify(body) : undefined }),
     env
@@ -50,7 +51,7 @@ const check = (name, cond, extra = '') => {
 };
 
 const localState = {
-  v: 16, answers: { 'eco-01': { st: '2', imp: 3 }, 'tra-v1': { st: '1', imp: 2 } },
+  v: 16, answers: { 'eco-01': { st: '2', imp: 3, sub: { favm: 'option_détaillée', second: 'autre' } }, 'tra-v1': { st: '1', imp: 2 } },
   mode: 'fusion', focus: [], idx: 4, autoAdv: false, subStep: null, order: ['eco-01'],
   stageSnapshots: {}, checkpoint: 1, paused: false, finished: false,
   updatedAt: new Date().toISOString(),
@@ -80,6 +81,7 @@ check('authenticated=true', r.data.authenticated === true);
 check('hasAnyAccount=true', r.data.hasAnyAccount === true);
 check('state renvoyé', !!r.data.state && Object.keys(r.data.state.answers).length === 2);
 check('revision=1', r.data.revision === 1);
+check('précisions conservées lors de la migration', r.data.state.answers['eco-01'].sub?.favm === 'option_détaillée');
 
 console.log('\n=== 4. PUT /api/state (mise à jour) ===');
 r = await call('/api/state', { method: 'PUT', body: {
@@ -167,6 +169,48 @@ r = await call('/api/state', { method: 'PUT', raw: '{ceci nest pas du json', coo
 check('corps non-JSON → 400', r.status === 400);
 r = await call('/api/inexistant');
 check('route inconnue → 404', r.status === 404);
+
+console.log('\n=== 15. Précisions et concurrence ===');
+r = await call('/api/auth/session');
+const baseRevision = r.data.revision;
+const subState = { ...localState, answers: { 'eco-01': { st: '2', imp: 3, sub: { option: 'valeur', autre: 'seconde' } } } };
+const [raceA, raceB] = await Promise.all([
+  call('/api/state', { method: 'PUT', body: { state: subState, expectedRevision: baseRevision, backupPrevious: true } }),
+  call('/api/state', { method: 'PUT', body: { state: localState, expectedRevision: baseRevision, backupPrevious: true } }),
+]);
+check('une seule écriture simultanée acceptée', [raceA.status, raceB.status].sort().join(',') === '200,409');
+check('une seule révision ajoutée', (await call('/api/auth/session')).data.revision === baseRevision + 1);
+const winnerState = raceA.status === 200 ? subState : localState;
+const currentState = (await call('/api/auth/session')).data.state;
+check('les précisions de la version gagnante sont conservées', JSON.stringify(currentState.answers['eco-01'].sub) === JSON.stringify(winnerState.answers['eco-01'].sub));
+const allBackups = await call('/api/state/backups');
+const countBeforeStale = allBackups.data.backups.length;
+r = await call('/api/state', { method: 'PUT', body: { state: subState, expectedRevision: baseRevision, backupPrevious: true } });
+check('aucune archive créée pour une écriture périmée', r.status === 409 && (await call('/api/state/backups')).data.backups.length === countBeforeStale);
+r = await call('/api/state', { method: 'PUT', body: { state: subState, expectedRevision: baseRevision + 1, backupPrevious: true } });
+check('écriture des précisions sans perte', r.status === 200 && (await call('/api/auth/session')).data.state.answers['eco-01'].sub?.autre === 'seconde');
+r = await call('/api/state', { method: 'PUT', body: { state: subState } });
+check('révision obligatoire hors mode forcé', r.status === 400);
+r = await call('/api/state', { method: 'PUT', raw: JSON.stringify({ state: { padding: 'x'.repeat(2 * 1024 * 1024) }, expectedRevision: 0 }) });
+check('corps trop volumineux refusé', r.status === 413);
+r = await call('/api/auth/register', { method: 'POST', raw: 'null', cookies: '' });
+check('JSON null refusé sans erreur serveur', r.status === 400);
+
+console.log('\n=== 16. Anti-force brute renforcé et ré-hachage ===');
+for (let i = 0; i < 20; i++) {
+  await call('/api/auth/login', { method: 'POST', body: { email: 'cible@exemple.fr', password: 'faux' }, cookies: '', ip: `198.51.100.${i + 1}` });
+}
+r = await call('/api/auth/login', { method: 'POST', body: { email: 'cible@exemple.fr', password: 'faux' }, cookies: '', ip: '198.51.100.21' });
+check('limite par compte sur plusieurs IP', r.status === 429);
+for (let i = 0; i < 50; i++) {
+  await call('/api/auth/login', { method: 'POST', body: { email: `tentative${i}@exemple.fr`, password: 'faux' }, cookies: '', ip: '192.0.2.5' });
+}
+r = await call('/api/auth/login', { method: 'POST', body: { email: 'suivant@exemple.fr', password: 'faux' }, cookies: '', ip: '192.0.2.5' });
+check('limite par IP sur plusieurs comptes', r.status === 429);
+env.PBKDF2_ITERATIONS = 100001;
+r = await call('/api/auth/login', { method: 'POST', body: { email: 'test@exemple.fr', password: 'motdepasse123' }, cookies: '', ip: '192.0.2.6' });
+check('rehachage du mot de passe à la connexion si coût augmenté', r.status === 200 && db.prepare('SELECT iterations FROM users WHERE email=?').get('test@exemple.fr').iterations === 100001);
+delete env.PBKDF2_ITERATIONS;
 
 console.log(`\n${'='.repeat(52)}`);
 console.log(`  RÉSULTAT : ${pass} tests réussis, ${fail} échec(s)`);

@@ -20,12 +20,13 @@ const stmt = (sql, params = []) => {
   const norm = params.map((p) => (p === undefined ? null : p));
   return {
     bind: (...m) => stmt(sql, [...norm, ...m]),
+    _runSync: () => /^\s*SELECT\b/i.test(sql) ? ({ success: true, results: db.prepare(sql).all(...norm), meta: {} }) : ({ success: true, meta: db.prepare(sql).run(...norm) }),
     first: async () => s.get(...norm) ?? null,
     all: async () => ({ results: s.all(...norm) }),
     run: async () => ({ success: true, meta: s.run(...norm) }),
   };
 };
-const env = { DB: { prepare: (sql) => stmt(sql) } };
+const env = { DB: { prepare: (sql) => stmt(sql), batch: async (statements) => db.transaction(() => statements.map((s) => s._runSync()))() } };
 const PUBLIC = path.resolve('./public');
 
 /* Faux binding ASSETS : reproduit ce que fait Cloudflare pour [assets].

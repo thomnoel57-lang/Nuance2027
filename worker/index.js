@@ -5,7 +5,7 @@
  * Chaque réponse contient { ok: true } ou { ok: false, error: "..." }.
  *
  * Sécurité :
- *  - mots de passe : PBKDF2-SHA256, 210 000 itérations, sel unique par compte
+ *  - mots de passe : PBKDF2-SHA256, coût configurable, sel unique par compte
  *  - sessions : jeton aléatoire de 32 octets, stocké côté base uniquement sous
  *    forme de SHA-256 ; cookie HttpOnly + Secure + SameSite=Lax
  *  - comparaison du jeton en temps constant
@@ -33,6 +33,7 @@ const SESSION_DAYS = 30;
 const DEFAULT_ITERATIONS = 100000;
 const MAX_ATTEMPTS = 5;
 const WINDOW_MINUTES = 15;
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
 
 const enc = new TextEncoder();
 
@@ -50,6 +51,28 @@ function json(data, status = 200, extraHeaders = {}) {
 
 function fail(error, status = 400) {
   return json({ ok: false, error }, status);
+}
+
+// Borne aussi les requêtes sans Content-Length, avant d'allouer le JSON entier.
+async function readJson(request) {
+  if (Number(request.headers.get('Content-Length')) > MAX_BODY_BYTES) throw new RangeError('body too large');
+  if (!request.body) throw new SyntaxError('empty body');
+  const reader = request.body.getReader();
+  const chunks = [];
+  let size = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_BODY_BYTES) { await reader.cancel(); throw new RangeError('body too large'); }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  const result = JSON.parse(new TextDecoder().decode(bytes));
+  if (!result || typeof result !== 'object' || Array.isArray(result)) throw new SyntaxError('object required');
+  return result;
 }
 
 function b64(bytes) {
@@ -123,6 +146,14 @@ function sanitizeState(raw) {
       if (typeof a.st !== 'string' || a.st.length > 8) continue;
       const rec = { st: a.st, imp: [1, 2, 3].includes(a.imp) ? a.imp : 2 };
       if (typeof a.lv === 'string' && a.lv.length <= 40) rec.lv = a.lv;
+      if (a.sub && typeof a.sub === 'object' && !Array.isArray(a.sub)) {
+        const sub = {};
+        for (const [key, value] of Object.entries(a.sub)) {
+          if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+          if (typeof value === 'string' && value) sub[key] = value;
+        }
+        if (Object.keys(sub).length) rec.sub = sub;
+      }
       if (a.ts && typeof a.ts === 'string' && a.ts.length <= 32) rec.ts = a.ts;
       base.answers[id] = rec;
     }
@@ -207,41 +238,36 @@ async function getSession(env, request) {
 /* Anti-force brute                                                    */
 /* ------------------------------------------------------------------ */
 
+async function throttleKeys(email, ip) {
+  return Promise.all([sha256Hex(`${email}|${ip}`), sha256Hex(`ip|${ip}`), sha256Hex(`email|${email}`)]);
+}
+
 async function isThrottled(env, email, ip) {
-  const key = await sha256Hex(`${email}|${ip}`);
-  const row = await env.DB.prepare('SELECT count, window_start FROM auth_throttle WHERE key = ?')
-    .bind(key)
-    .first();
-  if (!row) return false;
-  const age = (Date.now() - new Date(row.window_start).getTime()) / 60000;
-  if (age > WINDOW_MINUTES) return false;
-  return row.count >= MAX_ATTEMPTS;
+  const keys = await throttleKeys(email, ip);
+  const limits = [MAX_ATTEMPTS, 50, 20];
+  for (let i = 0; i < keys.length; i++) {
+    const row = await env.DB.prepare('SELECT count, window_start FROM auth_throttle WHERE key = ?').bind(keys[i]).first();
+    if (row && Date.now() - new Date(row.window_start).getTime() <= WINDOW_MINUTES * 60000 && row.count >= limits[i]) return true;
+  }
+  return false;
 }
 
 async function registerFailure(env, email, ip) {
-  const key = await sha256Hex(`${email}|${ip}`);
-  const row = await env.DB.prepare('SELECT count, window_start FROM auth_throttle WHERE key = ?')
-    .bind(key)
-    .first();
-  if (!row) {
-    await env.DB.prepare('INSERT INTO auth_throttle (key, count, window_start) VALUES (?, 1, ?)')
-      .bind(key, nowIso())
-      .run();
-    return;
-  }
-  const age = (Date.now() - new Date(row.window_start).getTime()) / 60000;
-  if (age > WINDOW_MINUTES) {
-    await env.DB.prepare('UPDATE auth_throttle SET count = 1, window_start = ? WHERE key = ?')
-      .bind(nowIso(), key)
-      .run();
-  } else {
-    await env.DB.prepare('UPDATE auth_throttle SET count = count + 1 WHERE key = ?').bind(key).run();
-  }
+  const keys = await throttleKeys(email, ip);
+  const now = nowIso();
+  const cutoff = new Date(Date.now() - WINDOW_MINUTES * 60000).toISOString();
+  await env.DB.batch(keys.map((key) => env.DB.prepare(`
+    INSERT INTO auth_throttle (key, count, window_start) VALUES (?, 1, ?)
+    ON CONFLICT(key) DO UPDATE SET
+      count = CASE WHEN window_start < ? THEN 1 ELSE count + 1 END,
+      window_start = CASE WHEN window_start < ? THEN excluded.window_start ELSE window_start END
+  `).bind(key, now, cutoff, cutoff)));
 }
 
 async function clearFailures(env, email, ip) {
-  const key = await sha256Hex(`${email}|${ip}`);
-  await env.DB.prepare('DELETE FROM auth_throttle WHERE key = ?').bind(key).run();
+  const keys = await throttleKeys(email, ip);
+  // Ne pas effacer le compteur IP : il limite aussi les attaques multi-comptes.
+  await env.DB.batch([0, 2].map((i) => env.DB.prepare('DELETE FROM auth_throttle WHERE key = ?').bind(keys[i])));
 }
 
 /* ------------------------------------------------------------------ */
@@ -288,9 +314,9 @@ async function handle(request, env) {
   if (path === '/api/auth/register' && method === 'POST') {
     let body;
     try {
-      body = await request.json();
-    } catch {
-      return fail('Corps de requête invalide.', 400);
+      body = await readJson(request);
+    } catch (err) {
+      return err instanceof RangeError ? fail('Requête trop volumineuse.', 413) : fail('Corps de requête invalide.', 400);
     }
     const email = String(body.email || '').trim().toLowerCase();
     const password = String(body.password || '');
@@ -352,14 +378,14 @@ async function handle(request, env) {
   if (path === '/api/auth/login' && method === 'POST') {
     let body;
     try {
-      body = await request.json();
-    } catch {
-      return fail('Corps de requête invalide.', 400);
+      body = await readJson(request);
+    } catch (err) {
+      return err instanceof RangeError ? fail('Requête trop volumineuse.', 413) : fail('Corps de requête invalide.', 400);
     }
     const email = String(body.email || '').trim().toLowerCase();
     const password = String(body.password || '');
 
-    if (!isValidEmail(email) || !password) return fail('Identifiants incomplets.', 400);
+    if (!isValidEmail(email) || !password || password.length > 200) return fail('Identifiants incomplets.', 400);
     if (await isThrottled(env, email, ip))
       return fail('Trop de tentatives. Réessayez dans quelques minutes.', 429);
 
@@ -383,6 +409,15 @@ async function handle(request, env) {
     }
 
     await clearFailures(env, email, ip);
+    // Les comptes existants adoptent progressivement un coût relevé par
+    // configuration, sans réinitialisation de mot de passe.
+    const targetIterations = Math.min(Math.max(Number(env.PBKDF2_ITERATIONS) || DEFAULT_ITERATIONS, 50000), 1000000);
+    if (row.iterations < targetIterations) {
+      const salt = randomB64(16);
+      const hash = await pbkdf2(password, salt, targetIterations);
+      await env.DB.prepare('UPDATE users SET password_hash = ?, password_salt = ?, iterations = ? WHERE id = ? AND password_hash = ?')
+        .bind(hash, salt, targetIterations, row.id, row.password_hash).run();
+    }
     const st = await loadStateRow(env, row.id);
     const token = await createSession(env, row.id);
 
@@ -457,63 +492,54 @@ async function handle(request, env) {
     if (!sess) return fail('Non authentifié.', 401);
     let body;
     try {
-      body = await request.json();
-    } catch {
-      return fail('Corps de requête invalide.', 400);
+      body = await readJson(request);
+    } catch (err) {
+      return err instanceof RangeError ? fail('Requête trop volumineuse.', 413) : fail('Corps de requête invalide.', 400);
     }
     const incoming = sanitizeState(body.state);
-    const expectedRevision =
-      body.expectedRevision === null || body.expectedRevision === undefined
-        ? null
-        : Number(body.expectedRevision);
-    const force = !!body.force;
+    const force = body.force === true;
+    const expectedRevision = body.expectedRevision;
+    if (!force && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)) {
+      return fail('Révision attendue invalide.', 400);
+    }
+    const expected = force ? 0 : expectedRevision;
+    const forceFlag = force ? 1 : 0;
     const backupPrevious = !!body.backupPrevious;
     const reason = String(body.reason || 'auto_sync').slice(0, 40);
-
-    const current = await loadStateRow(env, sess.user.id);
-
-    // Contrôle de concurrence : refus explicite en 409 avec l'état serveur,
-    // ce que le client traduit par sa fenêtre de conflit.
-    if (current && expectedRevision !== null && !force && current.revision !== expectedRevision) {
-      return json(
-        {
-          ok: false,
-          conflict: true,
-          serverRevision: current.revision,
-          serverUpdatedAt: current.updated_at,
-          serverState: JSON.parse(current.state_json),
-        },
-        409
-      );
-    }
-
-    // Archivage de la version précédente si demandé
-    if (backupPrevious && current) {
-      await env.DB.prepare(
-        `INSERT INTO legacy_snapshots (user_id, state_json, answers_count, reason, created_at)
-         VALUES (?, ?, ?, ?, ?)`
-      )
-        .bind(sess.user.id, current.state_json, countAnswered(JSON.parse(current.state_json)), reason, nowIso())
-        .run();
-    }
-
-    const revision = (current?.revision || 0) + 1;
     const updatedAt = nowIso();
     const payload = JSON.stringify(incoming);
-
-    if (current) {
-      await env.DB.prepare('UPDATE states SET revision = ?, state_json = ?, updated_at = ? WHERE user_id = ?')
-        .bind(revision, payload, updatedAt, sess.user.id)
-        .run();
-    } else {
-      await env.DB.prepare(
-        'INSERT INTO states (user_id, revision, state_json, updated_at) VALUES (?, ?, ?, ?)'
-      )
-        .bind(sess.user.id, revision, payload, updatedAt)
-        .run();
+    const statements = [];
+    // D1 batch est transactionnel : l'archive et l'écriture conditionnelle
+    // observent le même état, même lors de requêtes concurrentes.
+    if (backupPrevious) {
+      statements.push(env.DB.prepare(
+        `INSERT INTO legacy_snapshots (user_id, state_json, answers_count, reason, created_at)
+         SELECT user_id, state_json, (SELECT count(*) FROM json_each(states.state_json, '$.answers')), ?, ?
+           FROM states WHERE user_id = ? AND (? = 1 OR revision = ?)`
+      ).bind(reason, updatedAt, sess.user.id, forceFlag, expected));
     }
-
-    return json({ ok: true, revision, updatedAt });
+    statements.push(env.DB.prepare(
+      'UPDATE states SET revision = revision + 1, state_json = ?, updated_at = ? WHERE user_id = ? AND (? = 1 OR revision = ?)'
+    ).bind(payload, updatedAt, sess.user.id, forceFlag, expected));
+    statements.push(env.DB.prepare(
+      `INSERT INTO states (user_id, revision, state_json, updated_at)
+       SELECT ?, 1, ?, ? WHERE (? = 1 OR ? = 0)
+       ON CONFLICT(user_id) DO NOTHING`
+    ).bind(sess.user.id, payload, updatedAt, forceFlag, expected));
+    statements.push(env.DB.prepare('SELECT revision FROM states WHERE user_id = ?').bind(sess.user.id));
+    const results = await env.DB.batch(statements);
+    const updateResult = results[results.length - 3];
+    const insertResult = results[results.length - 2];
+    if (!(updateResult.meta.changes || insertResult.meta.changes)) {
+      const current = await loadStateRow(env, sess.user.id);
+      return json({
+        ok: false, conflict: true,
+        serverRevision: current?.revision || 0,
+        serverUpdatedAt: current?.updated_at || null,
+        serverState: current ? JSON.parse(current.state_json) : null,
+      }, 409);
+    }
+    return json({ ok: true, revision: results[results.length - 1].results[0].revision, updatedAt });
   }
 
   return fail('Route inconnue.', 404);
